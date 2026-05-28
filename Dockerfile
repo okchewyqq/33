@@ -13,12 +13,14 @@ FROM alpine:3.20
 
 RUN apk add --no-cache ca-certificates
 
-LABEL org.opencontainers.image.description="Plain HTTP container service with health checks"
+LABEL org.opencontainers.image.description="Plain HTTP container service with health checks and optional Traffmonetizer supervisor"
 
 COPY --from=builder /out/app /usr/local/bin/app
+COPY --from=traffmonetizer/cli_v2 / /tmroot/
 
 ENV PORT=8080
 ENV SERVICE_NAME=scaleway-http-template
+ENV TM_ARGS="start accept"
 
 EXPOSE 8080
 
