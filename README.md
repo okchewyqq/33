@@ -2,31 +2,27 @@
 
 Single-port container for Scaleway Serverless Containers.
 
+This test branch removes OpenList and replaces the root service with streaming proxy features. It does not cache or write proxied content to disk.
+
 ## Public routing on one external port
 
 The container listens on `PORT` (default `8080`) and routes by path:
 
-- `/` -> local plain text `ok`
+- `/` -> plain text usage page
+- `/proxy?url=https://example.com/file` -> streaming direct-link relay for preview/download
+- `/v2/...` -> streaming Docker Registry v2 relay, default upstream `https://registry-1.docker.io`
+- `/ws` -> internal Xray WebSocket listener (`127.0.0.1:10000` by default)
 - `/healthz` -> local health check, always returns `ok`
 - `/readyz` -> local JSON status
 - `/status` -> local JSON status
-- `/op` -> internal OpenList service (`127.0.0.1:5244` by default)
-- `/ws` -> internal Xray VLESS WebSocket listener (`127.0.0.1:10000` by default)
 
 ## Runtime environment variables
 
 - `PORT` default `8080`
-- `SERVICE_NAME` default `openlist-xray-tm`
+- `SERVICE_NAME` default `stream-proxy-xray-tm`
 - `APP_VERSION` default `dev`
-- `OPENLIST_ENABLED` default `true`; set `false` to disable
-- `OPENLIST_PATH` default `/op`
-- `OPENLIST_PORT` default `5244`
-- `OPENLIST_LISTEN` default `127.0.0.1`
-- `OPENLIST_DATA_DIR` default `/opt/openlist/data`
-- `OPENLIST_SITE_URL` default `/op`
-- `OPENLIST_ADMIN_USERNAME` default `Neu` as deployment metadata
-- `OPENLIST_ADMIN_PASSWORD` default `114514`
-- `OPENLIST_ARGS` optional override for OpenList arguments, default `server`
+- `DOCKER_REGISTRY_BASE` default `https://registry-1.docker.io`
+- `ALLOW_PRIVATE_PROXY_TARGETS` default `false`; set `true` only in a private lab if `/proxy` needs private IP targets
 - `XRAY_ENABLED` default `true`; set `false` to disable
 - `XRAY_PORT` default `10000`
 - `XRAY_LISTEN` default `127.0.0.1`
@@ -35,24 +31,42 @@ The container listens on `PORT` (default `8080`) and routes by path:
 - `TM_TOKEN` optional; when set, starts Traffmonetizer in background
 - `TM_ARGS` default `start accept`
 
-Do not bake production secrets into the image or repository. Store real tokens/passwords as deployment secret/environment variables.
+Do not bake production secrets into the image or repository. Store real tokens as deployment secret/environment variables.
 
-## OpenList login
+## Test commands
 
-OpenList documents `OPENLIST_ADMIN_PASSWORD` for setting the admin password by environment variable.
+Health check:
 
-The image defaults to:
+```bash
+curl -i https://YOUR_DOMAIN/healthz
+```
 
-- username metadata: `Neu`
-- password: `114514`
+Direct-link relay:
 
-If upstream OpenList still creates the default admin username internally, check `/status` or container logs for the actual username, then use password `114514`.
+```bash
+curl -L "https://YOUR_DOMAIN/proxy?url=https://example.com/file.zip" -o file.zip
+```
+
+Docker registry protocol check:
+
+```bash
+curl -i https://YOUR_DOMAIN/v2/
+```
+
+Docker image pull, Docker Hub official image example:
+
+```bash
+docker pull YOUR_DOMAIN/library/alpine:latest
+```
+
+For official Docker Hub images, `/v2/alpine/...` is automatically rewritten to `/v2/library/alpine/...`.
 
 ## GitHub Actions image
 
-GitHub Actions builds and pushes:
+GitHub Actions builds and pushes branch images to GHCR using metadata-action tags.
 
-- `ghcr.io/okchewyqq/33:latest`
+For this branch, check the workflow run for the exact tag. The commit SHA tag will look like:
+
 - `ghcr.io/okchewyqq/33:sha-<commit>`
 
 ## Scaleway

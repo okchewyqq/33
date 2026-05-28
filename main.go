@@ -3,7 +3,9 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -29,7 +31,6 @@ type Response struct {
 	Version   string               `json:"version,omitempty"`
 	Timestamp time.Time            `json:"timestamp"`
 	Routes    map[string]string    `json:"routes"`
-	OpenList  map[string]string    `json:"openlist"`
 	Processes map[string]ProcState `json:"processes"`
 }
 
@@ -218,56 +219,20 @@ func startXray() {
 	supervise("xray", bin, []string{"run", "-config", configPath}, "run -config /tmp/xray/config.json")
 }
 
-func openListArgs() []string {
-	if text := strings.TrimSpace(os.Getenv("OPENLIST_ARGS")); text != "" {
-		return splitArgs(text)
-	}
-	return []string{"server"}
-}
-
-func ensureOpenListConfig() {
-	dataDir := getenv("OPENLIST_DATA_DIR", "/opt/openlist/data")
-	if err := os.MkdirAll(dataDir, 0755); err != nil {
-		setProc("openlist", "error", err.Error(), false)
-		return
-	}
-	_ = os.Setenv("SITE_URL", strings.TrimRight(getenv("OPENLIST_SITE_URL", "/op"), "/"))
-	_ = os.Setenv("HTTP_PORT", getenv("OPENLIST_PORT", "5244"))
-	_ = os.Setenv("ADDRESS", getenv("OPENLIST_LISTEN", "127.0.0.1"))
-	_ = os.Setenv("OPENLIST_ADMIN_PASSWORD", getenv("OPENLIST_ADMIN_PASSWORD", "114514"))
-}
-
-func startOpenList() {
-	if strings.EqualFold(getenv("OPENLIST_ENABLED", "true"), "false") {
-		setProc("openlist", "disabled", "", false)
-		return
-	}
-	ensureOpenListConfig()
-	bin := findExecutable([]string{"/usr/local/bin/openlist", "/usr/bin/openlist", "/bin/openlist"}, []string{"openlist"})
-	// OPENLIST_ADMIN_PASSWORD sets the initial admin password in OpenList Docker builds.
-	// The default admin username is usually admin; OPENLIST_ADMIN_USERNAME is kept as
-	// metadata/status because upstream does not expose a documented username env var.
-	supervise("openlist", bin, openListArgs(), "server")
-}
-
-func response(serviceName, version, opPath, wsPath, openListTarget, xrayTarget string) Response {
+func response(serviceName, version, wsPath, dockerRegistry string) Response {
 	return Response{
 		OK:        true,
 		Service:   serviceName,
 		Version:   version,
 		Timestamp: time.Now().UTC(),
 		Routes: map[string]string{
-			"/":        "local ok page",
-			opPath:     openListTarget,
-			wsPath:     xrayTarget,
+			"/":        "proxy usage page",
+			"/proxy":   "stream URL relay: /proxy?url=https://example.com/file",
+			"/v2/":     "stream Docker registry relay for " + dockerRegistry,
+			wsPath:     "xray websocket endpoint",
 			"/healthz": "local health check",
 			"/readyz":  "local status",
 			"/status":  "local status",
-		},
-		OpenList: map[string]string{
-			"path":     opPath,
-			"username": getenv("OPENLIST_ADMIN_USERNAME", "Neu"),
-			"password": getenv("OPENLIST_ADMIN_PASSWORD", "114514"),
 		},
 		Processes: getProcs(),
 	}
@@ -289,6 +254,123 @@ func proxyTo(target string) *httputil.ReverseProxy {
 	return p
 }
 
+var hopByHopHeaders = map[string]bool{
+	"Connection":          true,
+	"Keep-Alive":          true,
+	"Proxy-Authenticate":  true,
+	"Proxy-Authorization": true,
+	"Te":                  true,
+	"Trailer":             true,
+	"Transfer-Encoding":   true,
+	"Upgrade":             true,
+}
+
+func copyRequestHeaders(dst, src http.Header) {
+	for key, values := range src {
+		canonical := http.CanonicalHeaderKey(key)
+		if hopByHopHeaders[canonical] {
+			continue
+		}
+		for _, value := range values {
+			dst.Add(canonical, value)
+		}
+	}
+}
+
+func copyResponseHeaders(dst, src http.Header) {
+	for key, values := range src {
+		canonical := http.CanonicalHeaderKey(key)
+		if hopByHopHeaders[canonical] {
+			continue
+		}
+		dst.Del(canonical)
+		for _, value := range values {
+			dst.Add(canonical, value)
+		}
+	}
+}
+
+func streamHTTP(w http.ResponseWriter, r *http.Request, target string) {
+	if r.Body != nil {
+		defer r.Body.Close()
+	}
+	upReq, err := http.NewRequestWithContext(r.Context(), r.Method, target, r.Body)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	copyRequestHeaders(upReq.Header, r.Header)
+	upReq.Host = upReq.URL.Host
+
+	client := &http.Client{Timeout: 0}
+	res, err := client.Do(upReq)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	defer res.Body.Close()
+	copyResponseHeaders(w.Header(), res.Header)
+	w.WriteHeader(res.StatusCode)
+	_, _ = io.Copy(w, res.Body)
+}
+
+func isPrivateHost(host string) bool {
+	host = strings.Trim(host, "[]")
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return true
+	}
+	for _, ip := range ips {
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+			return true
+		}
+	}
+	return false
+}
+
+func handleURLProxy(w http.ResponseWriter, r *http.Request) {
+	rawURL := strings.TrimSpace(r.URL.Query().Get("url"))
+	if rawURL == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "missing url query parameter"})
+		return
+	}
+	target, err := url.Parse(rawURL)
+	if err != nil || target.Host == "" || (target.Scheme != "http" && target.Scheme != "https") {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "url must be absolute http(s) URL"})
+		return
+	}
+	if !strings.EqualFold(getenv("ALLOW_PRIVATE_PROXY_TARGETS", "false"), "true") && isPrivateHost(target.Hostname()) {
+		writeJSON(w, http.StatusForbidden, map[string]any{"ok": false, "error": "private proxy targets are disabled"})
+		return
+	}
+	streamHTTP(w, r, target.String())
+}
+
+func dockerHubPath(path string) string {
+	if !strings.HasPrefix(path, "/v2/") {
+		return path
+	}
+	trimmed := strings.TrimPrefix(path, "/v2/")
+	parts := strings.Split(trimmed, "/")
+	if len(parts) >= 3 && (parts[1] == "manifests" || parts[1] == "blobs") {
+		return "/v2/library/" + trimmed
+	}
+	return path
+}
+
+func registryTargetURL(r *http.Request, registryBase string) string {
+	base := strings.TrimRight(registryBase, "/")
+	path := dockerHubPath(r.URL.Path)
+	if r.URL.RawQuery != "" {
+		path += "?" + r.URL.RawQuery
+	}
+	return base + path
+}
+
+func handleRegistryProxy(w http.ResponseWriter, r *http.Request, registryBase string) {
+	streamHTTP(w, r, registryTargetURL(r, registryBase))
+}
+
 func normalizePath(path string) string {
 	path = strings.TrimSpace(path)
 	if path == "" {
@@ -308,21 +390,24 @@ func isPrefixPath(requestPath, prefix string) bool {
 	return requestPath == prefix || strings.HasPrefix(requestPath, prefix+"/")
 }
 
+func usagePage(w http.ResponseWriter, registryBase string) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = fmt.Fprintf(w, "ok\n\nURL relay:\n  /proxy?url=https://example.com/file\n\nDocker registry relay:\n  /v2/... -> %s\n", registryBase)
+}
+
 func main() {
 	port := getenv("PORT", "8080")
-	serviceName := getenv("SERVICE_NAME", "openlist-xray-tm")
+	serviceName := getenv("SERVICE_NAME", "stream-proxy-xray-tm")
 	version := getenv("APP_VERSION", "dev")
 	wsPath := normalizePath(getenv("VLESS_WS_PATH", "/ws"))
-	opPath := normalizePath(getenv("OPENLIST_PATH", "/op"))
+	registryBase := strings.TrimRight(getenv("DOCKER_REGISTRY_BASE", "https://registry-1.docker.io"), "/")
 
-	startOpenList()
 	startXray()
 	startTraffmonetizer()
 
 	xrayTarget := "http://127.0.0.1:" + getenv("XRAY_PORT", "10000")
-	openListTarget := "http://127.0.0.1:" + getenv("OPENLIST_PORT", "5244")
 	xrayProxy := proxyTo(xrayTarget)
-	openListProxy := proxyTo(openListTarget)
 
 	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -330,27 +415,26 @@ func main() {
 		_, _ = w.Write([]byte("ok"))
 	})
 	http.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, response(serviceName, version, opPath, wsPath, openListTarget, xrayTarget))
+		writeJSON(w, http.StatusOK, response(serviceName, version, wsPath, registryBase))
 	})
 	http.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, response(serviceName, version, opPath, wsPath, openListTarget, xrayTarget))
+		writeJSON(w, http.StatusOK, response(serviceName, version, wsPath, registryBase))
 	})
+	http.HandleFunc("/proxy", handleURLProxy)
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if isPrefixPath(r.URL.Path, wsPath) {
 			xrayProxy.ServeHTTP(w, r)
 			return
 		}
-		if isPrefixPath(r.URL.Path, opPath) {
-			openListProxy.ServeHTTP(w, r)
+		if isPrefixPath(r.URL.Path, "/v2") {
+			handleRegistryProxy(w, r, registryBase)
 			return
 		}
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
+		usagePage(w, registryBase)
 	})
 
 	addr := "0.0.0.0:" + port
-	log.Printf("%s listening on %s; / -> ok; %s -> %s; %s -> %s; /healthz local", serviceName, addr, opPath, openListTarget, wsPath, xrayTarget)
+	log.Printf("%s listening on %s; /proxy URL relay; /v2 -> %s; %s -> %s; /healthz local", serviceName, addr, registryBase, wsPath, xrayTarget)
 	if err := http.ListenAndServe(addr, nil); err != nil {
 		log.Fatal(err)
 	}
