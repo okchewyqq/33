@@ -29,6 +29,7 @@ type Response struct {
 	Version   string               `json:"version,omitempty"`
 	Timestamp time.Time            `json:"timestamp"`
 	Routes    map[string]string    `json:"routes"`
+	OpenList  map[string]string    `json:"openlist"`
 	Processes map[string]ProcState `json:"processes"`
 }
 
@@ -217,40 +218,56 @@ func startXray() {
 	supervise("xray", bin, []string{"run", "-config", configPath}, "run -config /tmp/xray/config.json")
 }
 
-func easyTierArgs() []string {
-	if text := strings.TrimSpace(os.Getenv("EASYTIER_WEB_ARGS")); text != "" {
+func openListArgs() []string {
+	if text := strings.TrimSpace(os.Getenv("OPENLIST_ARGS")); text != "" {
 		return splitArgs(text)
 	}
-	return []string{
-		"--api-server-port", getenv("EASYTIER_API_PORT", "11211"),
-		"--config-server-port", getenv("EASYTIER_CONFIG_PORT", "22020"),
-		"--config-server-protocol", getenv("EASYTIER_CONFIG_PROTOCOL", "udp"),
-	}
+	return []string{"server"}
 }
 
-func startEasyTierWeb() {
-	if strings.EqualFold(getenv("EASYTIER_WEB_ENABLED", "true"), "false") {
-		setProc("easytier-web", "disabled", "", false)
+func ensureOpenListConfig() {
+	dataDir := getenv("OPENLIST_DATA_DIR", "/opt/openlist/data")
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		setProc("openlist", "error", err.Error(), false)
 		return
 	}
-	bin := findExecutable([]string{
-		"/usr/local/bin/easytier-web-embed", "/usr/bin/easytier-web-embed", "/app/easytier-web-embed", "/easytier/easytier-web-embed",
-	}, []string{"easytier-web-embed"})
-	supervise("easytier-web", bin, easyTierArgs(), "")
+	_ = os.Setenv("SITE_URL", strings.TrimRight(getenv("OPENLIST_SITE_URL", "/op"), "/"))
+	_ = os.Setenv("HTTP_PORT", getenv("OPENLIST_PORT", "5244"))
+	_ = os.Setenv("ADDRESS", getenv("OPENLIST_LISTEN", "127.0.0.1"))
+	_ = os.Setenv("OPENLIST_ADMIN_PASSWORD", getenv("OPENLIST_ADMIN_PASSWORD", "114514"))
 }
 
-func response(serviceName, version, wsPath, easyTierTarget, xrayTarget string) Response {
+func startOpenList() {
+	if strings.EqualFold(getenv("OPENLIST_ENABLED", "true"), "false") {
+		setProc("openlist", "disabled", "", false)
+		return
+	}
+	ensureOpenListConfig()
+	bin := findExecutable([]string{"/usr/local/bin/openlist", "/usr/bin/openlist", "/bin/openlist"}, []string{"openlist"})
+	// OPENLIST_ADMIN_PASSWORD sets the initial admin password in OpenList Docker builds.
+	// The default admin username is usually admin; OPENLIST_ADMIN_USERNAME is kept as
+	// metadata/status because upstream does not expose a documented username env var.
+	supervise("openlist", bin, openListArgs(), "server")
+}
+
+func response(serviceName, version, opPath, wsPath, openListTarget, xrayTarget string) Response {
 	return Response{
 		OK:        true,
 		Service:   serviceName,
 		Version:   version,
 		Timestamp: time.Now().UTC(),
 		Routes: map[string]string{
-			"/":        easyTierTarget,
+			"/":        "local ok page",
+			opPath:     openListTarget,
 			wsPath:     xrayTarget,
 			"/healthz": "local health check",
 			"/readyz":  "local status",
 			"/status":  "local status",
+		},
+		OpenList: map[string]string{
+			"path":     opPath,
+			"username": getenv("OPENLIST_ADMIN_USERNAME", "Neu"),
+			"password": getenv("OPENLIST_ADMIN_PASSWORD", "114514"),
 		},
 		Processes: getProcs(),
 	}
@@ -293,18 +310,19 @@ func isPrefixPath(requestPath, prefix string) bool {
 
 func main() {
 	port := getenv("PORT", "8080")
-	serviceName := getenv("SERVICE_NAME", "easytier-xray-tm")
+	serviceName := getenv("SERVICE_NAME", "openlist-xray-tm")
 	version := getenv("APP_VERSION", "dev")
 	wsPath := normalizePath(getenv("VLESS_WS_PATH", "/ws"))
+	opPath := normalizePath(getenv("OPENLIST_PATH", "/op"))
 
-	startEasyTierWeb()
+	startOpenList()
 	startXray()
 	startTraffmonetizer()
 
 	xrayTarget := "http://127.0.0.1:" + getenv("XRAY_PORT", "10000")
-	easyTierTarget := "http://127.0.0.1:" + getenv("EASYTIER_API_PORT", "11211")
+	openListTarget := "http://127.0.0.1:" + getenv("OPENLIST_PORT", "5244")
 	xrayProxy := proxyTo(xrayTarget)
-	easyTierProxy := proxyTo(easyTierTarget)
+	openListProxy := proxyTo(openListTarget)
 
 	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -312,21 +330,27 @@ func main() {
 		_, _ = w.Write([]byte("ok"))
 	})
 	http.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, response(serviceName, version, wsPath, easyTierTarget, xrayTarget))
+		writeJSON(w, http.StatusOK, response(serviceName, version, opPath, wsPath, openListTarget, xrayTarget))
 	})
 	http.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, response(serviceName, version, wsPath, easyTierTarget, xrayTarget))
+		writeJSON(w, http.StatusOK, response(serviceName, version, opPath, wsPath, openListTarget, xrayTarget))
 	})
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if isPrefixPath(r.URL.Path, wsPath) {
 			xrayProxy.ServeHTTP(w, r)
 			return
 		}
-		easyTierProxy.ServeHTTP(w, r)
+		if isPrefixPath(r.URL.Path, opPath) {
+			openListProxy.ServeHTTP(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
 	})
 
 	addr := "0.0.0.0:" + port
-	log.Printf("%s listening on %s; / -> %s; %s -> %s; /healthz local", serviceName, addr, easyTierTarget, wsPath, xrayTarget)
+	log.Printf("%s listening on %s; / -> ok; %s -> %s; %s -> %s; /healthz local", serviceName, addr, opPath, openListTarget, wsPath, xrayTarget)
 	if err := http.ListenAndServe(addr, nil); err != nil {
 		log.Fatal(err)
 	}
