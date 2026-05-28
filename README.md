@@ -1,41 +1,45 @@
 # 33
 
-Plain HTTP container service template for GitHub Actions + GHCR + Scaleway Serverless Containers.
+Single-port container for Scaleway Serverless Containers.
 
-It can also supervise Traffmonetizer in the background when `TM_TOKEN` is provided at runtime.
+## Public routing on one external port
 
-## Endpoints
+The container listens on `PORT` (default `8080`) and routes by path:
 
-- `GET /` returns JSON service status, including Traffmonetizer state
-- `GET /healthz` returns `ok`
-- `GET /readyz` returns `ready`
+- `/healthz` -> local health check, always returns `ok`
+- `/readyz` -> local JSON status
+- `/status` -> local JSON status
+- `/ws` -> internal Xray VLESS WebSocket listener (`127.0.0.1:10000` by default)
+- `/` and every other path -> internal EasyTier Web service (`127.0.0.1:11211` by default)
 
-## Runtime
+This matches platforms that expose only one container port.
 
-Environment variables:
+## Runtime environment variables
 
 - `PORT` default `8080`
-- `SERVICE_NAME` default `scaleway-http-template`
+- `SERVICE_NAME` default `easytier-xray-tm`
 - `APP_VERSION` default `dev`
+- `EASYTIER_WEB_ENABLED` default `true`; set `false` to disable
+- `EASYTIER_API_PORT` default `11211`
+- `EASYTIER_CONFIG_PORT` default `22020`
+- `EASYTIER_CONFIG_PROTOCOL` default `udp`
+- `EASYTIER_WEB_ARGS` optional override for all EasyTier Web arguments
+- `XRAY_ENABLED` default `true`; set `false` to disable
+- `XRAY_PORT` default `10000`
+- `XRAY_LISTEN` default `127.0.0.1`
+- `VLESS_WS_PATH` default `/ws`
+- `VLESS_UUID` default `10974d1a-cbd6-4b6f-db1d-38d78b3fb109`
 - `TM_TOKEN` optional; when set, starts Traffmonetizer in background
 - `TM_ARGS` default `start accept`
 
-Equivalent runtime behavior:
+Do not bake secrets into the image or repository. Store `TM_TOKEN` as a deployment secret/environment variable.
 
-```bash
-docker run -d --restart always --network host --name tm \
-  -e TM_TOKEN='your-token' \
-  ghcr.io/<owner>/33:latest
-```
-
-Do not bake tokens into the image or repository. Store `TM_TOKEN` as a deployment secret/environment variable.
-
-## Image
+## GitHub Actions image
 
 GitHub Actions builds and pushes:
 
-- `ghcr.io/<owner>/33:latest`
-- `ghcr.io/<owner>/33:sha-<commit>`
+- `ghcr.io/okchewyqq/33:latest`
+- `ghcr.io/okchewyqq/33:sha-<commit>`
 
 ## Scaleway
 
@@ -43,4 +47,4 @@ Use:
 
 - Container port: `8080`
 - Health check path: `/healthz`
-- Environment variable: `TM_TOKEN=<your token>`
+- Optional environment variable: `TM_TOKEN=<your token>`

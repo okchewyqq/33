@@ -28,6 +28,7 @@ type Response struct {
 	Service   string               `json:"service"`
 	Version   string               `json:"version,omitempty"`
 	Timestamp time.Time            `json:"timestamp"`
+	Routes    map[string]string    `json:"routes"`
 	Processes map[string]ProcState `json:"processes"`
 }
 
@@ -161,10 +162,7 @@ func writeXrayConfig() (string, error) {
 	}
 
 	listen := getenv("XRAY_LISTEN", "127.0.0.1")
-	wsPath := getenv("VLESS_WS_PATH", "/ws")
-	if !strings.HasPrefix(wsPath, "/") {
-		wsPath = "/" + wsPath
-	}
+	wsPath := normalizePath(getenv("VLESS_WS_PATH", "/ws"))
 	uuid := getenv("VLESS_UUID", "10974d1a-cbd6-4b6f-db1d-38d78b3fb109")
 
 	cfg := map[string]any{
@@ -223,15 +221,11 @@ func easyTierArgs() []string {
 	if text := strings.TrimSpace(os.Getenv("EASYTIER_WEB_ARGS")); text != "" {
 		return splitArgs(text)
 	}
-	args := []string{
+	return []string{
 		"--api-server-port", getenv("EASYTIER_API_PORT", "11211"),
 		"--config-server-port", getenv("EASYTIER_CONFIG_PORT", "22020"),
 		"--config-server-protocol", getenv("EASYTIER_CONFIG_PROTOCOL", "udp"),
 	}
-	if apiHost := strings.TrimSpace(os.Getenv("EASYTIER_API_HOST")); apiHost != "" {
-		args = append(args, "--api-host", apiHost)
-	}
-	return args
 }
 
 func startEasyTierWeb() {
@@ -245,12 +239,19 @@ func startEasyTierWeb() {
 	supervise("easytier-web", bin, easyTierArgs(), "")
 }
 
-func response(serviceName, version string) Response {
+func response(serviceName, version, wsPath, easyTierTarget, xrayTarget string) Response {
 	return Response{
 		OK:        true,
 		Service:   serviceName,
 		Version:   version,
 		Timestamp: time.Now().UTC(),
+		Routes: map[string]string{
+			"/":        easyTierTarget,
+			wsPath:     xrayTarget,
+			"/healthz": "local health check",
+			"/readyz":  "local status",
+			"/status":  "local status",
+		},
 		Processes: getProcs(),
 	}
 }
@@ -271,10 +272,30 @@ func proxyTo(target string) *httputil.ReverseProxy {
 	return p
 }
 
+func normalizePath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "/"
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	return path
+}
+
+func isPrefixPath(requestPath, prefix string) bool {
+	prefix = normalizePath(prefix)
+	if prefix == "/" {
+		return true
+	}
+	return requestPath == prefix || strings.HasPrefix(requestPath, prefix+"/")
+}
+
 func main() {
 	port := getenv("PORT", "8080")
 	serviceName := getenv("SERVICE_NAME", "easytier-xray-tm")
 	version := getenv("APP_VERSION", "dev")
+	wsPath := normalizePath(getenv("VLESS_WS_PATH", "/ws"))
 
 	startEasyTierWeb()
 	startXray()
@@ -284,10 +305,6 @@ func main() {
 	easyTierTarget := "http://127.0.0.1:" + getenv("EASYTIER_API_PORT", "11211")
 	xrayProxy := proxyTo(xrayTarget)
 	easyTierProxy := proxyTo(easyTierTarget)
-	wsPath := getenv("VLESS_WS_PATH", "/ws")
-	if !strings.HasPrefix(wsPath, "/") {
-		wsPath = "/" + wsPath
-	}
 
 	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -295,13 +312,13 @@ func main() {
 		_, _ = w.Write([]byte("ok"))
 	})
 	http.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, response(serviceName, version))
+		writeJSON(w, http.StatusOK, response(serviceName, version, wsPath, easyTierTarget, xrayTarget))
 	})
 	http.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, response(serviceName, version))
+		writeJSON(w, http.StatusOK, response(serviceName, version, wsPath, easyTierTarget, xrayTarget))
 	})
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == wsPath || strings.HasPrefix(r.URL.Path, wsPath+"/") {
+		if isPrefixPath(r.URL.Path, wsPath) {
 			xrayProxy.ServeHTTP(w, r)
 			return
 		}
@@ -309,7 +326,7 @@ func main() {
 	})
 
 	addr := "0.0.0.0:" + port
-	log.Printf("%s listening on %s, / -> %s, %s -> %s", serviceName, addr, easyTierTarget, wsPath, xrayTarget)
+	log.Printf("%s listening on %s; / -> %s; %s -> %s; /healthz local", serviceName, addr, easyTierTarget, wsPath, xrayTarget)
 	if err := http.ListenAndServe(addr, nil); err != nil {
 		log.Fatal(err)
 	}
