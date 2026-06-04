@@ -10,8 +10,8 @@ The container listens on `PORT` (default `8080`) and routes by path:
 - `/healthz` -> local health check, always returns `ok`
 - `/readyz` -> local JSON status
 - `/status` -> local JSON status
-- `/op` -> internal OpenList service (`127.0.0.1:5244` by default)
-- `/ws` -> internal Xray VLESS WebSocket listener (`127.0.0.1:10000` by default)
+- `/op` -> internal OpenList service (`0.0.0.0:5244` by default; proxied locally via `127.0.0.1`)
+- `/ws` -> internal Xray VLESS WebSocket listener (`0.0.0.0:10000` by default; proxied locally via `127.0.0.1`)
 
 ## Runtime environment variables
 
@@ -21,7 +21,7 @@ The container listens on `PORT` (default `8080`) and routes by path:
 - `OPENLIST_ENABLED` default `true`; set `false` to disable
 - `OPENLIST_PATH` default `/op`
 - `OPENLIST_PORT` default `5244`
-- `OPENLIST_LISTEN` default `127.0.0.1`
+- `OPENLIST_LISTEN` default `0.0.0.0`
 - `OPENLIST_DATA_DIR` default `/opt/openlist/data`
 - `OPENLIST_SITE_URL` default `/op`
 - `OPENLIST_ADMIN_USERNAME` default `Neu` as deployment metadata
@@ -29,7 +29,7 @@ The container listens on `PORT` (default `8080`) and routes by path:
 - `OPENLIST_ARGS` optional override for OpenList arguments, default `server`
 - `XRAY_ENABLED` default `true`; set `false` to disable
 - `XRAY_PORT` default `10000`
-- `XRAY_LISTEN` default `127.0.0.1`
+- `XRAY_LISTEN` default `0.0.0.0`
 - `VLESS_WS_PATH` default `/ws`
 - `VLESS_UUID` default `10974d1a-cbd6-4b6f-db1d-38d78b3fb109`
 - `TM_TOKEN` optional; when set, starts Traffmonetizer in background

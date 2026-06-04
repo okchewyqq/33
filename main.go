@@ -162,7 +162,7 @@ func writeXrayConfig() (string, error) {
 		return "", fmt.Errorf("invalid XRAY_PORT")
 	}
 
-	listen := getenv("XRAY_LISTEN", "127.0.0.1")
+	listen := getenv("XRAY_LISTEN", "0.0.0.0")
 	wsPath := normalizePath(getenv("VLESS_WS_PATH", "/ws"))
 	uuid := getenv("VLESS_UUID", "10974d1a-cbd6-4b6f-db1d-38d78b3fb109")
 
@@ -233,7 +233,7 @@ func ensureOpenListConfig() {
 	}
 	_ = os.Setenv("SITE_URL", strings.TrimRight(getenv("OPENLIST_SITE_URL", "/op"), "/"))
 	_ = os.Setenv("HTTP_PORT", getenv("OPENLIST_PORT", "5244"))
-	_ = os.Setenv("ADDRESS", getenv("OPENLIST_LISTEN", "127.0.0.1"))
+	_ = os.Setenv("ADDRESS", getenv("OPENLIST_LISTEN", "0.0.0.0"))
 	_ = os.Setenv("OPENLIST_ADMIN_PASSWORD", getenv("OPENLIST_ADMIN_PASSWORD", "114514"))
 }
 
