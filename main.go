@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -35,10 +37,47 @@ type Response struct {
 	Processes map[string]ProcState `json:"processes"`
 }
 
+type DLRequestInput struct {
+	Method  string            `json:"method"`
+	URL     string            `json:"url"`
+	Body    string            `json:"body"`
+	Headers map[string]string `json:"headers"`
+	Token   string            `json:"token"`
+	MaxAge  int64             `json:"max_age"`
+}
+
+type DLStoredRequest struct {
+	Method    string            `json:"method"`
+	URL       string            `json:"url"`
+	Body      string            `json:"body,omitempty"`
+	Headers   map[string]string `json:"headers,omitempty"`
+	ExpiresAt time.Time         `json:"expires_at"`
+}
+
 var (
 	procMu sync.RWMutex
 	procs  = map[string]ProcState{}
+
+	dlStoreMu sync.RWMutex
+	dlStore   = map[string]DLStoredRequest{}
 )
+
+var dlRequestHeadersExposed = []string{
+	"accept", "accept-encoding", "accept-language", "cache-control", "range", "user-agent",
+}
+
+var dlResponseHeadersExposed = []string{
+	"Accept-Ranges", "Cache-Control", "Connection", "Content-Disposition", "Content-Encoding", "Content-Length", "Content-Range", "Content-Type", "Date",
+}
+
+var dlHTTPClient = &http.Client{
+	Timeout: 5 * time.Minute,
+	Transport: func() http.RoundTripper {
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		transport.DisableCompression = true
+		return transport
+	}(),
+}
 
 func getenv(key, fallback string) string {
 	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
@@ -252,7 +291,7 @@ func startOpenList() {
 	supervise("openlist", bin, openListArgs(), "server")
 }
 
-func response(serviceName, version, opPath, wsPath, openListTarget, xrayTarget string) Response {
+func response(serviceName, version, opPath, wsPath, dlPath, openListTarget, xrayTarget string) Response {
 	return Response{
 		OK:        true,
 		Service:   serviceName,
@@ -262,6 +301,7 @@ func response(serviceName, version, opPath, wsPath, openListTarget, xrayTarget s
 			"/":        "local ok page",
 			opPath:     openListTarget,
 			wsPath:     xrayTarget,
+			dlPath:     "download proxy",
 			"/healthz": "local health check",
 			"/readyz":  "local status",
 			"/status":  "local status",
@@ -421,12 +461,309 @@ func rewriteOpenListHTML(body []byte, prefix string) []byte {
 	return out
 }
 
+func dlIndexHTML(prefix string) string {
+	prefix = strings.TrimRight(normalizePath(prefix), "/")
+	if prefix == "" {
+		prefix = "/"
+	}
+	return `<!doctype html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Download Proxy</title>
+</head>
+<body>
+<input type="url" placeholder="url" id="url" style="height: 20px;width: 80%; display: block;">
+<input type="submit" id="submit" value="submit"/>
+<div><a id="a" href=""></a></div>
+<p>注:该工具只针对直链有效</p>
+<hr>
+<h3>代理下载</h3>
+<p>GET ` + prefix + `/down/http://example.com</p>
+<p>直接将网址放到url后面即可</p>
+<hr>
+<h3>身份匿名授权(dev)</h3>
+<p>适用场景:a访问b网址下载文件需要提供token,a想要c能够下载b网址的文件,但又不想让c知道token内容.
+    a可以通过提交token给服务,服务生成临时链接供c使用,c无法得知token的内容.</p>
+<p>获取临时链接</p>
+<p>POST ` + prefix + `/request/ {method = 'GET', url, body = '', headers = {}, token, max_age = 12*3600}</p>
+<p>使用key</p>
+<div>GET ` + prefix + `/request/ODAzMzUyMzY1MjY1MDQw</div>
+<script>
+    document.getElementById('submit').onclick = function () {
+        const url = document.getElementById('url').value;
+        const a = document.getElementById('a');
+        if (!url || !url.startsWith('http')) {
+            a.textContent = "链接不合法: " + url;
+            a.href = 'javascript:void(0)';
+        } else {
+            a.href = a.textContent = (new URL(window.location.href)).origin + '` + prefix + `/down/' + url;
+        }
+    };
+</script>
+</body>
+</html>
+`
+}
+
+func handleDL(w http.ResponseWriter, r *http.Request, prefix string) {
+	if r.Method == http.MethodOptions {
+		w.Header().Set("Access-Control-Allow-Origin", corsHeader(r, "Origin"))
+		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,TRACE,DELETE,HEAD,OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", corsHeader(r, "Access-Control-Request-Headers"))
+		w.Header().Set("Access-Control-Max-Age", "86400")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	path := stripPrefixPath(r.URL.Path, prefix)
+	if path == "/" || path == "" {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(dlIndexHTML(prefix)))
+		return
+	}
+
+	requestPath := "/request/"
+	if strings.HasPrefix(path, requestPath) {
+		handleDLRequest(w, r, strings.TrimPrefix(path, requestPath))
+		return
+	}
+
+	downPath := "/down/"
+	if strings.HasPrefix(path, downPath) {
+		target := normalizeDLTarget(strings.TrimPrefix(path, downPath), r.URL.RawQuery)
+		handleDLDown(w, r, target)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(dlIndexHTML(prefix)))
+}
+
+func corsHeader(r *http.Request, key string) string {
+	if value := r.Header.Get(key); value != "" {
+		return value
+	}
+	return "*"
+}
+
+func handleDLRequest(w http.ResponseWriter, r *http.Request, id string) {
+	switch r.Method {
+	case http.MethodPost:
+		body, err := io.ReadAll(io.LimitReader(r.Body, 2048))
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": 400, "message": err.Error()})
+			return
+		}
+		if len(body) > 1024 {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": 400, "message": "your request data is too much long"})
+			return
+		}
+		var input DLRequestInput
+		if err := json.Unmarshal(body, &input); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": 400, "message": err.Error()})
+			return
+		}
+		if err := validateDLToken(input.Token); err != nil {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": 401, "message": err.Error()})
+			return
+		}
+		stored, err := normalizeDLRequest(input)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": 400, "message": err.Error()})
+			return
+		}
+		key, err := randKey()
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": 500, "message": err.Error()})
+			return
+		}
+		dlStoreMu.Lock()
+		dlStore[key] = stored
+		dlStoreMu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]string{"key": key})
+	case http.MethodGet:
+		if id == "" || strings.Contains(id, "/") {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": 400, "message": "invalid url, eg: /dl/request/ODAzMzUyMzY1MjY1MDQw"})
+			return
+		}
+		stored, ok := getDLStoredRequest(id)
+		if !ok {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": 404, "message": "no such key"})
+			return
+		}
+		proxyDLFetch(w, r, stored.URL, stored.Method, stored.Body, stored.Headers)
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": 405, "message": "method not allowed"})
+	}
+}
+
+func validateDLToken(token string) error {
+	required := strings.TrimSpace(os.Getenv("DL_REQUEST_TOKEN"))
+	if required != "" && token != required {
+		return fmt.Errorf("unauthorized key")
+	}
+	return nil
+}
+
+func normalizeDLRequest(input DLRequestInput) (DLStoredRequest, error) {
+	method := strings.ToUpper(strings.TrimSpace(input.Method))
+	if method == "" {
+		method = http.MethodGet
+	}
+	if _, err := url.ParseRequestURI(input.URL); err != nil || !isHTTPURL(input.URL) {
+		return DLStoredRequest{}, fmt.Errorf("url is invalid:%s", input.URL)
+	}
+	maxAge := input.MaxAge
+	if maxAge <= 0 {
+		maxAge = 12 * 3600
+	}
+	if maxAge > 7*24*3600 {
+		maxAge = 7 * 24 * 3600
+	}
+	return DLStoredRequest{
+		Method:    method,
+		URL:       input.URL,
+		Body:      input.Body,
+		Headers:   input.Headers,
+		ExpiresAt: time.Now().UTC().Add(time.Duration(maxAge) * time.Second),
+	}, nil
+}
+
+func getDLStoredRequest(key string) (DLStoredRequest, bool) {
+	now := time.Now().UTC()
+	dlStoreMu.RLock()
+	stored, ok := dlStore[key]
+	dlStoreMu.RUnlock()
+	if !ok {
+		return DLStoredRequest{}, false
+	}
+	if now.After(stored.ExpiresAt) {
+		dlStoreMu.Lock()
+		delete(dlStore, key)
+		dlStoreMu.Unlock()
+		return DLStoredRequest{}, false
+	}
+	return stored, true
+}
+
+func randKey() (string, error) {
+	b := make([]byte, 15)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+func handleDLDown(w http.ResponseWriter, r *http.Request, target string) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": 405, "message": "method not allowed"})
+		return
+	}
+	proxyDLFetch(w, r, target, r.Method, "", map[string]string{})
+}
+
+func proxyDLFetch(w http.ResponseWriter, r *http.Request, target, method, body string, extraHeaders map[string]string) {
+	if !isHTTPURL(target) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": 400, "message": "url is invalid:" + target})
+		return
+	}
+	if method == "" {
+		method = http.MethodGet
+	}
+	var reqBody io.Reader
+	if body != "" && method != http.MethodGet && method != http.MethodHead {
+		reqBody = strings.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(r.Context(), method, target, reqBody)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": 400, "message": err.Error()})
+		return
+	}
+	for _, key := range dlRequestHeadersExposed {
+		if value := r.Header.Get(key); value != "" {
+			req.Header.Set(key, value)
+		}
+	}
+	for key, value := range extraHeaders {
+		if strings.TrimSpace(key) != "" {
+			req.Header.Set(key, value)
+		}
+	}
+	resp, err := dlHTTPClient.Do(req)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": 502, "message": err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	for _, key := range dlResponseHeadersExposed {
+		if value := resp.Header.Get(key); value != "" {
+			w.Header().Set(key, value)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	if method != http.MethodHead {
+		_, _ = io.Copy(w, resp.Body)
+	}
+}
+
+func isHTTPURL(raw string) bool {
+	u, err := url.Parse(raw)
+	return err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != ""
+}
+
+func normalizeDLTarget(pathValue, rawQuery string) string {
+	target := pathValue
+	for _, scheme := range []string{"http", "https"} {
+		prefix := scheme + ":"
+		if strings.HasPrefix(target, prefix) {
+			target = prefix + "//" + strings.TrimLeft(target[len(prefix):], "/")
+			break
+		}
+	}
+	if rawQuery != "" {
+		target += "?" + rawQuery
+	}
+	return target
+}
+
+func redirectDLReferer(w http.ResponseWriter, r *http.Request, prefix string) bool {
+	referer := r.Header.Get("Referer")
+	if referer == "" {
+		return false
+	}
+	u, err := url.Parse(referer)
+	if err != nil {
+		return false
+	}
+	path := stripPrefixPath(u.Path, prefix)
+	const downPath = "/down/"
+	if !strings.HasPrefix(path, downPath) {
+		return false
+	}
+	target := normalizeDLTarget(strings.TrimPrefix(path, downPath), "")
+	targetURL, err := url.Parse(target)
+	if err != nil || targetURL.Scheme == "" || targetURL.Host == "" {
+		return false
+	}
+	location := strings.TrimRight(normalizePath(prefix), "/") + downPath + targetURL.Scheme + "://" + targetURL.Host + r.URL.Path
+	if r.URL.RawQuery != "" {
+		location += "?" + r.URL.RawQuery
+	}
+	http.Redirect(w, r, location, http.StatusMovedPermanently)
+	return true
+}
+
 func main() {
 	port := getenv("PORT", "8080")
 	serviceName := getenv("SERVICE_NAME", "openlist-xray-tm")
 	version := getenv("APP_VERSION", "dev")
 	wsPath := normalizePath(getenv("VLESS_WS_PATH", "/ws"))
 	opPath := normalizePath(getenv("OPENLIST_PATH", "/op"))
+	dlPath := normalizePath(getenv("DL_PATH", "/dl"))
 
 	startOpenList()
 	startXray()
@@ -437,18 +774,21 @@ func main() {
 	xrayProxy := proxyTo(xrayTarget)
 	openListProxy := openListProxyTo(openListTarget, opPath)
 
-	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
-	})
-	http.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, response(serviceName, version, opPath, wsPath, openListTarget, xrayTarget))
-	})
-	http.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, response(serviceName, version, opPath, wsPath, openListTarget, xrayTarget))
-	})
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/healthz":
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok"))
+			return
+		case "/readyz":
+			writeJSON(w, http.StatusOK, response(serviceName, version, opPath, wsPath, dlPath, openListTarget, xrayTarget))
+			return
+		case "/status":
+			writeJSON(w, http.StatusOK, response(serviceName, version, opPath, wsPath, dlPath, openListTarget, xrayTarget))
+			return
+		}
+
 		if isPrefixPath(r.URL.Path, wsPath) {
 			xrayProxy.ServeHTTP(w, r)
 			return
@@ -457,14 +797,21 @@ func main() {
 			openListProxy.ServeHTTP(w, withStrippedPrefix(r, opPath))
 			return
 		}
+		if isPrefixPath(r.URL.Path, dlPath) {
+			handleDL(w, r, dlPath)
+			return
+		}
+		if redirectDLReferer(w, r, dlPath) {
+			return
+		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
 
 	addr := "0.0.0.0:" + port
-	log.Printf("%s listening on %s; / -> ok; %s -> %s; %s -> %s; /healthz local", serviceName, addr, opPath, openListTarget, wsPath, xrayTarget)
-	if err := http.ListenAndServe(addr, nil); err != nil {
+	log.Printf("%s listening on %s; / -> ok; %s -> %s; %s -> %s; %s download proxy; /healthz local", serviceName, addr, opPath, openListTarget, wsPath, xrayTarget, dlPath)
+	if err := http.ListenAndServe(addr, handler); err != nil {
 		log.Fatal(err)
 	}
 }

@@ -23,7 +23,7 @@ RUN set -eux; \
 FROM alpine:3.21
 RUN apk add --no-cache ca-certificates tzdata tini
 
-LABEL org.opencontainers.image.description="OK root page, OpenList at /op, Xray VLESS WS at /ws, health checks, optional Traffmonetizer supervisor"
+LABEL org.opencontainers.image.description="OK root page, OpenList at /op, download proxy at /dl, Xray VLESS WS at /ws, health checks, optional Traffmonetizer supervisor"
 
 COPY --from=builder /out/app /usr/local/bin/app
 COPY --from=xray /usr/local/bin/xray /usr/local/bin/xray
@@ -42,6 +42,7 @@ ENV PORT=8080 \
     XRAY_LISTEN=0.0.0.0 \
     VLESS_WS_PATH=/ws \
     VLESS_UUID=10974d1a-cbd6-4b6f-db1d-38d78b3fb109 \
+    DL_PATH=/dl \
     TM_ARGS="start accept"
 
 EXPOSE 8080

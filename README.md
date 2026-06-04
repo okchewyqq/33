@@ -12,6 +12,7 @@ The container listens on `PORT` (default `8080`) and routes by path:
 - `/status` -> local JSON status
 - `/op` -> internal OpenList service (`0.0.0.0:5244` by default; proxied locally via `127.0.0.1`)
 - `/ws` -> internal Xray VLESS WebSocket listener (`0.0.0.0:10000` by default; proxied locally via `127.0.0.1`)
+- `/dl` -> local download proxy adapted from the Cloudflare Worker proxy script
 
 ## Runtime environment variables
 
@@ -32,10 +33,25 @@ The container listens on `PORT` (default `8080`) and routes by path:
 - `XRAY_LISTEN` default `0.0.0.0`
 - `VLESS_WS_PATH` default `/ws`
 - `VLESS_UUID` default `10974d1a-cbd6-4b6f-db1d-38d78b3fb109`
+- `DL_PATH` default `/dl`
+- `DL_REQUEST_TOKEN` optional; when set, required by `POST /dl/request/` to create temporary anonymous request links
 - `TM_TOKEN` optional; when set, starts Traffmonetizer in background
 - `TM_ARGS` default `start accept`
 
 Do not bake production secrets into the image or repository. Store real tokens/passwords as deployment secret/environment variables.
+
+## Download proxy
+
+Open `/dl` or `/dl/` for a small HTML entry page. The direct download form generates proxied links under `/dl/down/`.
+
+Examples:
+
+- `GET /dl/down/https://example.com/file.zip`
+- `HEAD /dl/down/https://example.com/file.zip`
+- `POST /dl/request/` with JSON body `{ "method": "GET", "url": "https://example.com/file.zip", "headers": {}, "max_age": 43200 }` returns `{ "key": "..." }`
+- `GET /dl/request/<key>` replays the stored request until it expires or the process restarts
+
+The `/dl/request/` storage is in memory, so temporary keys are not durable across container restarts. Set `DL_REQUEST_TOKEN` if deployments should require a token when creating temporary links.
 
 ## OpenList login
 
