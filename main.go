@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httputil"
@@ -289,6 +291,35 @@ func proxyTo(target string) *httputil.ReverseProxy {
 	return p
 }
 
+func openListProxyTo(target, opPath string) *httputil.ReverseProxy {
+	p := proxyTo(target)
+	p.ModifyResponse = func(resp *http.Response) error {
+		prefix := strings.TrimRight(normalizePath(opPath), "/")
+		if prefix == "" {
+			prefix = "/"
+		}
+		if loc := resp.Header.Get("Location"); prefix != "/" && loc != "" {
+			if rewritten := prefixRelativeLocation(loc, prefix); rewritten != loc {
+				resp.Header.Set("Location", rewritten)
+			}
+		}
+		if prefix == "/" || !strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/html") || resp.Body == nil {
+			return nil
+		}
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return err
+		}
+		_ = resp.Body.Close()
+		body = rewriteOpenListHTML(body, prefix)
+		resp.Body = io.NopCloser(bytes.NewReader(body))
+		resp.ContentLength = int64(len(body))
+		resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
+		return nil
+	}
+	return p
+}
+
 func normalizePath(path string) string {
 	path = strings.TrimSpace(path)
 	if path == "" {
@@ -308,6 +339,88 @@ func isPrefixPath(requestPath, prefix string) bool {
 	return requestPath == prefix || strings.HasPrefix(requestPath, prefix+"/")
 }
 
+func stripPrefixPath(requestPath, prefix string) string {
+	prefix = strings.TrimRight(normalizePath(prefix), "/")
+	if prefix == "" || prefix == "/" {
+		return requestPath
+	}
+	if requestPath == prefix {
+		return "/"
+	}
+	stripped := strings.TrimPrefix(requestPath, prefix)
+	if stripped == "" {
+		return "/"
+	}
+	if !strings.HasPrefix(stripped, "/") {
+		return "/" + stripped
+	}
+	return stripped
+}
+
+func withStrippedPrefix(r *http.Request, prefix string) *http.Request {
+	out := r.Clone(r.Context())
+	out.URL.Path = stripPrefixPath(r.URL.Path, prefix)
+	out.URL.RawPath = ""
+	out.Header.Del("Accept-Encoding")
+	out.Header.Set("X-Forwarded-Prefix", strings.TrimRight(normalizePath(prefix), "/"))
+	if out.Header.Get("X-Forwarded-Host") == "" {
+		out.Header.Set("X-Forwarded-Host", r.Host)
+	}
+	if out.Header.Get("X-Forwarded-Proto") == "" {
+		if r.TLS != nil {
+			out.Header.Set("X-Forwarded-Proto", "https")
+		} else {
+			out.Header.Set("X-Forwarded-Proto", "http")
+		}
+	}
+	return out
+}
+
+func prefixPath(prefix, path string) string {
+	prefix = strings.TrimRight(normalizePath(prefix), "/")
+	if prefix == "" || prefix == "/" {
+		return path
+	}
+	if path == "" || path == "/" {
+		return prefix + "/"
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	if isPrefixPath(path, prefix) {
+		return path
+	}
+	return prefix + path
+}
+
+func prefixRelativeLocation(location, prefix string) string {
+	if strings.HasPrefix(location, "//") || !strings.HasPrefix(location, "/") {
+		return location
+	}
+	u, err := url.Parse(location)
+	if err != nil || u.Path == "" || isPrefixPath(u.Path, prefix) {
+		return location
+	}
+	u.Path = prefixPath(prefix, u.Path)
+	return u.String()
+}
+
+func rewriteOpenListHTML(body []byte, prefix string) []byte {
+	replacements := [][2]string{
+		{"base_path: '/',", "base_path: '" + prefix + "',"},
+		{"base_path: \"/\",", "base_path: \"" + prefix + "\","},
+		{"href=\"/manifest.json\"", "href=\"" + prefix + "/manifest.json\""},
+		{"href='/manifest.json'", "href='" + prefix + "/manifest.json'"},
+		{"\"/assets/", "\"" + prefix + "/assets/"},
+		{"'/assets/", "'" + prefix + "/assets/"},
+	}
+	out := body
+	for _, replacement := range replacements {
+		out = bytes.ReplaceAll(out, []byte(replacement[0]), []byte(replacement[1]))
+	}
+	return out
+}
+
 func main() {
 	port := getenv("PORT", "8080")
 	serviceName := getenv("SERVICE_NAME", "openlist-xray-tm")
@@ -322,7 +435,7 @@ func main() {
 	xrayTarget := "http://127.0.0.1:" + getenv("XRAY_PORT", "10000")
 	openListTarget := "http://127.0.0.1:" + getenv("OPENLIST_PORT", "5244")
 	xrayProxy := proxyTo(xrayTarget)
-	openListProxy := proxyTo(openListTarget)
+	openListProxy := openListProxyTo(openListTarget, opPath)
 
 	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -341,7 +454,7 @@ func main() {
 			return
 		}
 		if isPrefixPath(r.URL.Path, opPath) {
-			openListProxy.ServeHTTP(w, r)
+			openListProxy.ServeHTTP(w, withStrippedPrefix(r, opPath))
 			return
 		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
